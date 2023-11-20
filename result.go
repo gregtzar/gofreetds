@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"time"
 )
 
 type Result struct {
@@ -43,18 +44,23 @@ func (r *Result) addValue(row, col int, value interface{}) {
 	r.Rows[row][col] = value
 }
 
-type ResultColumn struct {
-	Name   string
-	DbSize int
-	DbType int
-	Type   string
+// CurrentRow() returns current row (set by Next()).
+// Returns -1 as an error if Next() wasn't called.
+func (r *Result) CurrentRow() int {
+	return r.currentRow
 }
 
-func (r *Result) Next() bool {
+// HasNext returns true if we have more rows to process.
+func (r *Result) HasNext() bool {
 	if len(r.Rows) == 0 {
 		return false
 	}
-	if r.currentRow >= len(r.Rows)-1 {
+	return r.currentRow < len(r.Rows)-1
+}
+
+// Advances to the next row. Returns false if there is no more rows (i.e. we are on the last row).
+func (r *Result) Next() bool {
+	if !r.HasNext() {
 		return false
 	}
 	r.currentRow++
@@ -97,6 +103,41 @@ func (r *Result) MustScan(cnt int, dest ...interface{}) error {
 	return nil
 }
 
+// FindColumn returns an index of a column, found by name.
+// Returns error if the column isn't found.
+func (r *Result) FindColumn(name string) (int, error) {
+	for i, col := range r.Columns {
+		if name == col.Name {
+			return i, nil
+		}
+	}
+	return -1, fmt.Errorf("FindColumn('%s'): column not found in result", name)
+}
+
+// Find column with given name and scan it's value to the result.
+// Returns error if the column isn't found, otherwise returns error if the scan fails.
+func (r *Result) ScanColumn(name string, dest interface{}) error {
+	if r.currentRow == -1 {
+		return errors.New("ScanColumn called without calling Next.")
+	}
+
+	if !isPointer(dest) {
+		return errors.New("Destination not a pointer.")
+	}
+
+	i, err := r.FindColumn(name)
+	if err != nil {
+		return err
+	}
+
+	err = convertAssign(dest, r.Rows[r.currentRow][i])
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 //Copies values for the current row to the structure.
 //Struct filed name must match database column name.
 func (r *Result) scanStruct(s *reflect.Value) error {
@@ -105,7 +146,6 @@ func (r *Result) scanStruct(s *reflect.Value) error {
 		if f.IsValid() {
 			if f.CanSet() {
 				if err := convertAssign(f.Addr().Interface(), r.Rows[r.currentRow][i]); err != nil {
-					//if err := assignValue(r.Rows[r.currentRow][i], f.Addr().Interface());  err != nil {
 					return err
 				}
 				r.scanCount++
@@ -117,7 +157,9 @@ func (r *Result) scanStruct(s *reflect.Value) error {
 
 func asStructPointer(p interface{}) *reflect.Value {
 	sp := reflect.ValueOf(p)
-	if sp.Kind() == reflect.Ptr {
+	if _, ok := p.(*time.Time); ok {
+		return nil
+	} else if sp.Kind() == reflect.Ptr {
 		s := sp.Elem()
 		if s.Kind() == reflect.Struct {
 			return &s

@@ -4,12 +4,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchrcom/testify/assert"
+	"github.com/stretchr/testify/assert"
+)
+
+const (
+	sqlDateTimeOffSet = "2006-01-02T15:04:05-07:00"
 )
 
 func TestGoTo2SqlDataType2(t *testing.T) {
 	var checker = func(value interface{}, sqlType string, sqlFormatedValue string) {
-		actualSqlType, actualSqlFormatedValue := go2SqlDataType(value)
+		actualSqlType, actualSqlFormatedValue, err := go2SqlDataType(value)
+		assert.Nil(t, err)
 		assert.Equal(t, actualSqlType, sqlType)
 		assert.Equal(t, actualSqlFormatedValue, sqlFormatedValue)
 	}
@@ -25,7 +30,9 @@ func TestGoTo2SqlDataType2(t *testing.T) {
 	checker("iso medo isn't", "nvarchar (14)", "'iso medo isn''t'")
 
 	tm := time.Unix(1136239445, 0)
-	checker(tm, "nvarchar (25)", "'2006-01-02T23:04:05+01:00'")
+	paris, _ := time.LoadLocation("Europe/Paris")
+
+	checker(tm.In(paris), "datetimeoffset", "'"+tm.In(paris).Format(sqlDateTimeOffSet)+"'")
 
 	checker([]byte{1, 2, 3, 4, 5, 6, 7, 8}, "varbinary (8)", "0x0102030405060708")
 
@@ -52,7 +59,8 @@ func TestQuery2Statement(t *testing.T) {
 
 func TestGoTo2SqlDataType(t *testing.T) {
 	var checker = func(value interface{}, sqlType string, sqlFormatedValue string) {
-		actualSqlType, actualSqlFormatedValue := go2SqlDataType(value)
+		actualSqlType, actualSqlFormatedValue, err := go2SqlDataType(value)
+		assert.Nil(t, err)
 		assert.Equal(t, actualSqlType, sqlType)
 		assert.Equal(t, actualSqlFormatedValue, sqlFormatedValue)
 	}
@@ -67,7 +75,9 @@ func TestGoTo2SqlDataType(t *testing.T) {
 	checker("iso medo isn't", "nvarchar (14)", "'iso medo isn''t'")
 
 	tm := time.Unix(1136239445, 0)
-	checker(tm, "nvarchar (25)", "'2006-01-02T23:04:05+01:00'")
+	paris, _ := time.LoadLocation("Europe/Paris")
+
+	checker(tm.In(paris), "datetimeoffset", "'"+tm.In(paris).Format(sqlDateTimeOffSet)+"'")
 
 	checker([]byte{1, 2, 3, 4, 5, 6, 7, 8}, "varbinary (8)", "0x0102030405060708")
 
@@ -80,10 +90,25 @@ func TestExecuteSqlNumberOfParams(t *testing.T) {
 	c := &Conn{}
 	_, err := c.ExecuteSql("select 1 from foo where 1 = ? and 2 = ? and 3 = ?", 1, 2)
 	assert.NotNil(t, err)
+	assert.Contains(t, err.Error(), "Incorrect number of params")
 }
 
 func TestParseParams(t *testing.T) {
-	def, val := parseParams(1, 2, "pero")
+	def, val, err := parseParams(1, 2, "pero")
+	assert.Nil(t, err)
 	assert.Equal(t, def, "@p1 int, @p2 int, @p3 nvarchar (4)")
 	assert.Equal(t, val, "@p1=1, @p2=2, @p3='pero'")
+}
+
+func TestExecuteSqlDatetime(t *testing.T) {
+	c := ConnectToTestDb(t)
+	var err error
+	sql := "select top 1 datetime from dbo.freetds_types where datetime < ?"
+	if !c.sybaseMode125() {
+		_, err = c.ExecuteSql(sql, time.Now())
+	} else {
+		sql = "select top 1 datetime from freetds_types where datetime < ?"
+		_, err = c.executeSqlSybase125(sql, time.Now().Format("2006-01-02 15:04:05"))
+	}
+	assert.Nil(t, err)
 }

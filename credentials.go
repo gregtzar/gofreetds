@@ -6,15 +6,16 @@ import (
 )
 
 type credentials struct {
-	user, pwd, host, database, mirrorHost string
-	maxPoolSize                           int
+	user, pwd, host, database, mirrorHost, compatibility string
+	maxPoolSize, lockTimeout                             int
 }
 
+// NewCredentials fills credentials stusct from connection string
 func NewCredentials(connStr string) *credentials {
 	parts := strings.Split(connStr, ";")
 	crd := &credentials{maxPoolSize: 100}
 	for _, part := range parts {
-		kv := strings.Split(part, "=")
+		kv := strings.SplitN(part, "=", 2)
 		if len(kv) == 2 {
 			key := strings.ToLower(strings.Trim(kv[0], " "))
 			value := kv[1]
@@ -33,7 +34,14 @@ func NewCredentials(connStr string) *credentials {
 				if i, err := strconv.Atoi(value); err == nil {
 					crd.maxPoolSize = i
 				}
+			case "compatibility_mode", "compatibility mode", "compatibility":
+				crd.compatibility = strings.ToLower(value)
+			case "lock timeout", "lock_timeout":
+				if i, err := strconv.Atoi(value); err == nil {
+					crd.lockTimeout = i
+				}
 			}
+
 		}
 	}
 	return crd

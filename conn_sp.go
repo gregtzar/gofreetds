@@ -26,11 +26,21 @@ import "C"
 //Example:
 //  conn.ExecSp("sp_help", "authors")
 func (conn *Conn) ExecSp(spName string, params ...interface{}) (*SpResult, error) {
+	if conn.isDead() || conn.isMirrorSlave() {
+		if err := conn.reconnect(); err != nil {
+			return nil, err
+		}
+	}
+
 	//hold references to data sent to the C code until the end of this function
 	//without this GC could remove something used later in C, and we will get SIGSEG
 	refHolder := make([]*[]byte, 0)
 	conn.clearMessages()
-	if C.dbrpcinit(conn.dbproc, C.CString(spName), 0) == C.FAIL {
+
+	name := C.CString(spName)
+	defer C.free(unsafe.Pointer(name))
+
+	if C.dbrpcinit(conn.dbproc, name, 0) == C.FAIL {
 		return nil, conn.raiseError("dbrpcinit failed")
 	}
 	//input params
@@ -41,16 +51,17 @@ func (conn *Conn) ExecSp(spName string, params ...interface{}) (*SpResult, error
 	for i, spParam := range spParams {
 		//get datavalue for the suplied stored procedure parametar
 		var datavalue *C.BYTE
-		datalen := C.DBINT(0)
+		datalen := 0
 		if i < len(params) {
 			param := params[i]
 			if param != nil {
-				data, err := typeToSqlBuf(int(spParam.UserTypeId), param)
+				data, sqlDatalen, err := typeToSqlBuf(int(spParam.UserTypeId), param, conn.freetdsVersionGte095)
 				if err != nil {
+					conn.Close() //close the connection
 					return nil, err
 				}
 				if len(data) > 0 {
-					datalen = C.DBINT(len(data))
+					datalen = sqlDatalen
 					datavalue = (*C.BYTE)(unsafe.Pointer(&data[0]))
 					refHolder = append(refHolder, &data)
 				}
@@ -58,16 +69,19 @@ func (conn *Conn) ExecSp(spName string, params ...interface{}) (*SpResult, error
 		}
 		//set parametar valus, call dbrpcparam
 		if i < len(params) || spParam.IsOutput {
-			maxOutputSize := C.DBINT(0)
+			maxOutputSize := C.DBINT(-1)
 			status := C.BYTE(0)
 			if spParam.IsOutput {
 				status = C.DBRPCRETURN
 				maxOutputSize = C.DBINT(spParam.MaxLength)
+				if maxOutputSize == -1 {
+					maxOutputSize = 8000
+				}
 			}
 			paramname := C.CString(spParam.Name)
 			defer C.free(unsafe.Pointer(paramname))
 			if C.dbrpcparam(conn.dbproc, paramname, status,
-				C.int(spParam.UserTypeId), maxOutputSize, datalen, datavalue) == C.FAIL {
+				C.int(spParam.UserTypeId), maxOutputSize, C.DBINT(datalen), datavalue) == C.FAIL {
 				return nil, errors.New("dbrpcparam failed")
 			}
 		}
@@ -106,9 +120,8 @@ func (conn *Conn) ExecSp(spName string, params ...interface{}) (*SpResult, error
 func (conn *Conn) raise(err error) error {
 	if len(conn.Error) != 0 {
 		return errors.New(fmt.Sprintf("%s\n%s", conn.Error, conn.Message))
-	} else {
-		return err
 	}
+	return err
 }
 
 func (conn *Conn) raiseError(errMsg string) error {
@@ -116,16 +129,16 @@ func (conn *Conn) raiseError(errMsg string) error {
 }
 
 // func toRpcParam(datatype int, value interface{}) (datalen C.DBINT, datavalue *C.BYTE, err error) {
-// 	data, err := typeToSqlBuf(datatype, value)
-// 	if err != nil {
-// 		return
-// 	}
-// 	datalen = C.DBINT(len(data))
-// 	if len(data) > 0 {
-// 		datavalue = (*C.BYTE)(unsafe.Pointer(&data[0]))
-// 	}
-// 	//fmt.Printf("\ndatavalue: %v, datalen: %v, data: %v %s\n", datavalue, datalen, data, data)
-// 	return
+//   data, err := typeToSqlBuf(datatype, value)
+//   if err != nil {
+//     return
+//   }
+//   datalen = C.DBINT(len(data))
+//   if len(data) > 0 {
+//     datavalue = (*C.BYTE)(unsafe.Pointer(&data[0]))
+//   }
+//   //fmt.Printf("\ndatavalue: %v, datalen: %v, data: %v %s\n", datavalue, datalen, data, data)
+//   return
 // }
 
 //Stored procedure parameter definition
@@ -142,16 +155,12 @@ type spParam struct {
 //Read stored procedure parameters.
 //Will cache params in connection or pool and reuse it.
 func (conn *Conn) getSpParams(spName string) ([]*spParam, error) {
-	if spParams, ok := conn.spParamsCache[spName]; ok {
+	if spParams, ok := conn.spParamsCache.Get(spName); ok {
 		return spParams, nil
 	}
 
-	sql := fmt.Sprintf(`
-select name, parameter_id, user_type_id, is_output, max_length, precision, scale
-from sys.all_parameters
-where object_id =  (select object_id from sys.all_objects where object_id = object_id('%s'))
-order by parameter_id
-`, spName)
+	sql := conn.getSpParamsSql(spName)
+
 	results, err := conn.exec(sql)
 	if err != nil {
 		return nil, err
@@ -171,6 +180,38 @@ order by parameter_id
 		spParams[i] = p
 	}
 
-	conn.spParamsCache[spName] = spParams
+	conn.spParamsCache.Set(spName, spParams)
 	return spParams, nil
+}
+
+const msSqlGetSpParamsSql string = `
+select name, parameter_id, user_type_id, is_output, max_length, precision, scale
+from sys.all_parameters
+where object_id =  (select object_id from sys.all_objects where object_id = object_id('%s'))
+order by parameter_id
+`
+
+const sybaseAseGetSpParamsSql string = `
+  select name = c.name,
+         parameter_id = c.id,
+         user_type_id = c.type,
+         is_output = case
+                       when c.status2 = 2 or c.status2 = 4 then 1
+                       else 0
+                     end,
+         max_length = c.length,
+         precision = isnull(c.prec,0),
+         scale = isnull(c.scale,0)
+    from sysobjects o
+         join syscolumns c
+           on c.id = o.id
+  where o.name = '%s'
+  order by c.id, c.colid
+`
+
+func (conn *Conn) getSpParamsSql(spName string) string {
+	if conn.sybaseMode() || conn.sybaseMode125() {
+		return fmt.Sprintf(sybaseAseGetSpParamsSql, spName)
+	}
+	return fmt.Sprintf(msSqlGetSpParamsSql, spName)
 }

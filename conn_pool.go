@@ -31,11 +31,13 @@ type ConnPool struct {
 	connStr       string
 	maxConn       int
 	pool          []*Conn
+	done          chan bool
 	poolGuard     chan bool
 	poolMutex     sync.Mutex
 	cleanupTicker *time.Ticker
 	connCount     int
-	spParamsCache map[string][]*spParam
+
+	spParamsCache *ParamsCache
 }
 
 //NewCoonPool creates new connection pool.
@@ -56,7 +58,8 @@ func NewConnPool(connStr string) (*ConnPool, error) {
 		pool:          []*Conn{},
 		cleanupTicker: time.NewTicker(poolCleanupInterval),
 		connCount:     0,
-		spParamsCache: make(map[string][]*spParam),
+		spParamsCache: NewParamsCache(),
+		done:          make(chan bool, 1),
 	}
 	conn, err := p.newConn()
 	if err != nil {
@@ -66,8 +69,13 @@ func NewConnPool(connStr string) (*ConnPool, error) {
 	p.poolGuard = make(chan bool, p.maxConn)
 	p.addToPool(conn)
 	go func() {
-		for _ = range p.cleanupTicker.C {
-			p.cleanup()
+		for {
+			select {
+			case <-p.cleanupTicker.C:
+				p.cleanup()
+			case <-p.done:
+				return
+			}
 		}
 	}()
 	return p, nil
@@ -75,6 +83,8 @@ func NewConnPool(connStr string) (*ConnPool, error) {
 
 func (p *ConnPool) newConn() (*Conn, error) {
 	conn, err := NewConn(p.connStr)
+	p.poolMutex.Lock()
+	defer p.poolMutex.Unlock()
 	if err == nil {
 		conn.belongsToPool = p
 		//share stored procedure params cache between connections in the pool
@@ -92,7 +102,12 @@ func (p *ConnPool) Get() (*Conn, error) {
 	if conn != nil {
 		return conn, nil
 	}
-	return p.newConn()
+	conn, err := p.newConn()
+	if err != nil {
+		<-p.poolGuard //remove reservation
+		return nil, err
+	}
+	return conn, nil
 }
 
 //Get connection from pool and execute handler.
@@ -147,6 +162,9 @@ func (p *ConnPool) addToPool(conn *Conn) {
 		newPool = append(newPool, conn)
 		newPool = append(newPool, p.pool...)
 		p.pool = newPool
+	} else {
+		conn.close()
+		p.connCount--
 	}
 }
 
@@ -168,15 +186,16 @@ func (p *ConnPool) Close() {
 		conn.close()
 	}
 	p.pool = nil
+	close(p.done)
 }
 
 func (p *ConnPool) cleanup() {
+	p.poolMutex.Lock()
+	defer p.poolMutex.Unlock()
 	if len(p.pool) <= 1 {
 		return
 	}
-	p.poolMutex.Lock()
-	defer p.poolMutex.Unlock()
-	for i := len(p.pool) - 2; i >= 0; i-- {
+	for i := len(p.pool) - 1; i >= 1; i-- {
 		conn := p.pool[i]
 		if conn.expiresFromPool.Before(time.Now()) {
 			conn.close()
@@ -188,6 +207,8 @@ func (p *ConnPool) cleanup() {
 
 //Statistic about connections in the pool.
 func (p *ConnPool) Stat() (max, count, active int) {
+	p.poolMutex.Lock()
+	defer p.poolMutex.Unlock()
 	max = p.maxConn
 	count = p.connCount
 	inactive := len(p.pool)
